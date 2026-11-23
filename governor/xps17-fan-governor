@@ -1,0 +1,510 @@
+#!/usr/bin/python3 -I
+"""xps17-fan-governor: more fan than the BIOS gives, never less.
+
+Runs as a systemd service (Type=notify, WatchdogSec) on a Dell XPS 17 9720 with
+the patched dell_smm_hwmon loaded with xps17_fan_ctrl=1 or 2.
+
+Two states only, because the EC offers only three fan steps (0, 2400, 4200 RPM
+nominal) and the BIOS already uses the middle one:
+
+  BIOS   the BIOS runs the fans (pwm1_enable=2). Zero SMM calls in this state.
+  BOOST  the governor holds both fans at the top step (pwm1_enable=1, pwm=255).
+
+BIOS -> BOOST on any one of:
+  spike     coretemp "Package id 0" is >= HOT_C;
+  rise      it rose by RISE_C within RISE_WINDOW_S while already >= RISE_FLOOR_C;
+  baseline  its average over the last AVG_WINDOW_S is >= AVG_ON_C (the machine
+            is in its busy regime, where the bursts happen) and the BIOS has had
+            the fans for at least MIN_BIOS_S. This one does not wait for a burst:
+            it lowers the baseline the next burst starts from.
+BOOST -> BIOS only when all hold: the package has stayed <= COOL_C for
+COOL_HOLD_S, its AVG_WINDOW_S average is < AVG_OFF_C, and BOOST has lasted at
+least MIN_BOOST_S.
+
+The only fan speed this program ever writes is the maximum, so it cannot ask
+for less cooling than the BIOS would choose. Every exit path writes
+pwm1_enable=2; the unit's ExecStopPost does the same if this process is killed
+or hangs (systemd watchdog), and the patched driver does it on rmmod, before
+every system sleep, after every resume and at power-off. After a resume this
+program sends pwm1_enable=2 again itself.
+
+Whenever a hand-back (pwm1_enable=2) fails, the EC may still be in manual mode
+at an unknown step, so both fans are set to 255 at once and the hand-back is
+retried every 30 s. Fans at maximum are the safe direction.
+
+Logs (journal) only on transitions, refusals and start/stop.
+
+Usage: xps17-fan-governor            run (under systemd)
+       xps17-fan-governor --release  hand control to the BIOS and exit (ExecStopPost)
+"""
+
+import collections
+import os
+import signal
+import socket
+import stat
+import sys
+import time
+
+HWMON = "/sys/class/hwmon"
+PARAM = "/sys/module/dell_smm_hwmon/parameters/xps17_fan_ctrl"
+
+
+def env_f(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+CFG = {
+    "HOT_C": env_f("HOT_C", 88),
+    "RISE_C": env_f("RISE_C", 10),
+    "RISE_WINDOW_S": env_f("RISE_WINDOW_S", 2),
+    "RISE_FLOOR_C": env_f("RISE_FLOOR_C", 80),
+    "COOL_C": env_f("COOL_C", 75),
+    "COOL_HOLD_S": env_f("COOL_HOLD_S", 60),
+    "MIN_BOOST_S": env_f("MIN_BOOST_S", 60),
+    "POLL_S": env_f("POLL_S", 0.5),
+    "VERIFY_S": env_f("VERIFY_S", 15),
+    "AVG_WINDOW_S": env_f("AVG_WINDOW_S", 60),
+    "AVG_ON_C": env_f("AVG_ON_C", 68),
+    "AVG_OFF_C": env_f("AVG_OFF_C", 62),
+    "MIN_BIOS_S": env_f("MIN_BIOS_S", 60),
+    "RELEASE_RETRY_S": env_f("RELEASE_RETRY_S", 30),
+    "REFUSAL_BACKOFF_S": env_f("REFUSAL_BACKOFF_S", 600),
+    "REFUSAL_BACKOFF_MAX_S": env_f("REFUSAL_BACKOFF_MAX_S", 3600),
+}
+
+
+def log(msg, prio=6):
+    # "<N>" prefix = syslog priority for journald (SyslogLevelPrefix=yes default).
+    print(f"<{prio}>{msg}", flush=True)
+
+
+def sd_notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr[0] == "@":
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except OSError:
+        pass
+
+
+def boot_minus_mono():
+    """Grows by the time spent suspended; constant otherwise."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.clock_gettime(time.CLOCK_MONOTONIC)
+
+
+# --------------------------------------------------------------------- policy
+class Policy:
+    """Pure decision logic: temperatures in, desired state out. No I/O."""
+
+    def __init__(self, cfg):
+        self.c = cfg
+        self.state = "bios"
+        self.reason = ""
+        self.entered = 0.0
+        self.left = float("-inf")       # last BOOST -> BIOS
+        self.cool_since = None
+        self.reset()
+
+    def reset(self):
+        """Forget all history (after a sleep the old samples say nothing)."""
+        self.hist = collections.deque()          # RISE_WINDOW_S
+        self.win = collections.deque()           # AVG_WINDOW_S
+        self.win_sum = 0.0
+
+    def force_bios(self):
+        self.state = "bios"
+        self.cool_since = None
+
+    def average(self, now):
+        """Mean over AVG_WINDOW_S, or None until 90 % of the window is covered."""
+        if not self.win or now - self.win[0][0] < 0.9 * self.c["AVG_WINDOW_S"]:
+            return None
+        return self.win_sum / len(self.win)
+
+    def update(self, now, temp):
+        c = self.c
+        self.hist.append((now, temp))
+        while self.hist and now - self.hist[0][0] > c["RISE_WINDOW_S"]:
+            self.hist.popleft()
+        self.win.append((now, temp))
+        self.win_sum += temp
+        while now - self.win[0][0] > c["AVG_WINDOW_S"]:
+            self.win_sum -= self.win.popleft()[1]
+        avg = self.average(now)
+
+        if self.state == "bios":
+            low = min(t for _, t in self.hist)
+            if temp >= c["HOT_C"]:
+                self.reason = f"package {temp:.0f} C >= {c['HOT_C']:.0f} C"
+            elif temp >= c["RISE_FLOOR_C"] and temp - low >= c["RISE_C"]:
+                self.reason = f"package rose {low:.0f} -> {temp:.0f} C in {c['RISE_WINDOW_S']:.0f} s"
+            elif (avg is not None and avg >= c["AVG_ON_C"]
+                    and now - self.left >= c["MIN_BIOS_S"]):
+                self.reason = (f"{c['AVG_WINDOW_S']:.0f}-s average {avg:.1f} C "
+                               f">= {c['AVG_ON_C']:.0f} C")
+            else:
+                return self.state
+            self.state, self.entered, self.cool_since = "boost", now, None
+        else:
+            if temp <= c["COOL_C"]:
+                if self.cool_since is None:
+                    self.cool_since = now
+            else:
+                self.cool_since = None
+            if (self.cool_since is not None
+                    and now - self.cool_since >= c["COOL_HOLD_S"]
+                    and now - self.entered >= c["MIN_BOOST_S"]
+                    and avg is not None and avg < c["AVG_OFF_C"]):
+                self.reason = (f"package <= {c['COOL_C']:.0f} C for {now - self.cool_since:.0f} s, "
+                               f"average {avg:.1f} C < {c['AVG_OFF_C']:.0f} C")
+                self.state = "bios"
+                self.left = now
+                self.cool_since = None
+        return self.state
+
+
+# ------------------------------------------------------------------- hardware
+class NotReady(Exception):
+    pass
+
+
+def _write(path, value):
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        os.write(fd, value.encode())
+    finally:
+        os.close(fd)
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+class Hw:
+    """The patched dell_smm hwmon device plus coretemp. Every dell_smm access is an SMM call."""
+
+    def __init__(self, hwmon_root=HWMON, param=PARAM):
+        self.root, self.param = hwmon_root, param
+        self.smm = None
+        self.pkg = None
+
+    def _by_name(self, name):
+        for d in sorted(os.listdir(self.root)):
+            p = os.path.join(self.root, d)
+            try:
+                if _read(os.path.join(p, "name")) == name:
+                    return p
+            except OSError:
+                continue
+        return None
+
+    def discover(self):
+        """Find both devices; raise NotReady with a reason if the patched driver is not usable."""
+        core = self._by_name("coretemp")
+        if not core:
+            raise NotReady("no coretemp hwmon device")
+        self.pkg = None
+        for f in os.listdir(core):
+            if f.endswith("_label") and _read(os.path.join(core, f)) == "Package id 0":
+                self.pkg = os.path.join(core, f[: -len("_label")] + "_input")
+        if not self.pkg:
+            raise NotReady("coretemp has no 'Package id 0'")
+        smm = self._by_name("dell_smm")
+        if not smm:
+            raise NotReady("dell_smm_hwmon is not loaded")
+        try:
+            pair = _read(self.param)
+        except OSError:
+            raise NotReady("loaded dell_smm_hwmon is the stock driver (no xps17_fan_ctrl)")
+        if pair == "0":
+            raise NotReady("patched driver loaded with xps17_fan_ctrl=0 (no fan control)")
+        en = os.path.join(smm, "pwm1_enable")
+        if not os.path.exists(en) or stat.S_IMODE(os.stat(en).st_mode) != 0o200:
+            raise NotReady("pwm1_enable is not the BIOS on/off switch (DMI mismatch?)")
+        self.smm = smm
+        self.pwms = [p for p in (os.path.join(smm, "pwm1"), os.path.join(smm, "pwm2")) if os.path.exists(p)]
+        return pair
+
+    def present(self):
+        return self.smm is not None and os.path.exists(os.path.join(self.smm, "pwm1_enable"))
+
+    def read_pkg_c(self):
+        return int(_read(self.pkg)) / 1000.0
+
+    def take_control(self):          # 1 + 2 * len(pwms) SMM calls
+        # Ask for full speed BEFORE manual mode, so the EC is never in manual
+        # mode at its current (middle) step if a later write fails (review 2,
+        # problem 5). While the BIOS is in control it may ignore the request;
+        # that is harmless, the request is repeated right after the switch.
+        for p in self.pwms:
+            try:
+                _write(p, "255")
+            except OSError:
+                pass
+        _write(os.path.join(self.smm, "pwm1_enable"), "1")
+        for p in self.pwms:
+            _write(p, "255")
+
+    def release(self):               # 1 SMM call
+        _write(os.path.join(self.smm, "pwm1_enable"), "2")
+
+    def hold_max(self):              # len(pwms) SMM calls; both are tried even if one fails
+        err = None
+        for p in self.pwms:
+            try:
+                _write(p, "255")
+            except OSError as e:
+                err = e
+        if err:
+            raise err
+
+    def at_max(self):                # len(pwms) SMM calls
+        for p in self.pwms:
+            try:
+                if _read(p) != "255":
+                    return False
+            except OSError:          # ENODATA: the EC reports automatic mode
+                return False
+        return True
+
+
+# ------------------------------------------------------------------- governor
+class Governor:
+    def __init__(self, hw, cfg, clock=time.monotonic, jump=boot_minus_mono):
+        self.hw, self.c, self.clock, self.jump = hw, cfg, clock, jump
+        self.policy = Policy(cfg)
+        self.mode = "bios"            # what we last told the EC
+        self.ready = False
+        self.waiting_reason = None
+        self.next_discover = 0.0
+        self.refused_until = 0.0
+        self.backoff = cfg["REFUSAL_BACKOFF_S"]
+        self.last_verify = 0.0
+        self.strikes = 0
+        self.release_retry_at = 0.0
+        self.release_failures = 0
+        self.last_jump = jump()
+
+    def _status(self, text):
+        sd_notify(f"STATUS={text}")
+
+    def _release(self):
+        """pwm1_enable=2. Raises OSError on failure; resets the failure count on success."""
+        self.hw.release()
+        self.release_failures = 0
+
+    def _release_failed(self, now, err, where):
+        """A hand-back failed: the EC may be manual at any step. Hold both fans at 255."""
+        try:
+            self.hw.hold_max()
+            held = "both fans set to 255"
+        except OSError as e:
+            held = f"setting 255 failed too ({e.strerror})"
+        self.release_failures += 1
+        if self.release_failures == 1 or self.release_failures % 20 == 0:   # first, then every ~10 min
+            log(f"{where}: hand-back to the BIOS failed ({err.strerror}, "
+                f"{self.release_failures} in a row); {held}; "
+                f"retrying every {self.c['RELEASE_RETRY_S']:.0f} s", 3)
+        self.mode = "boost"             # treat as manual at maximum until a hand-back succeeds
+        self.release_retry_at = now + self.c["RELEASE_RETRY_S"]
+        self._status("held at maximum (BIOS refused the hand-back)")
+
+    def _refused(self, now, what):
+        self.refused_until = now + self.backoff
+        log(f"EC refused {what}; BIOS keeps the fans for {self.backoff:.0f} s", 4)
+        self.backoff = min(self.backoff * 2, self.c["REFUSAL_BACKOFF_MAX_S"])
+        self.policy.force_bios()
+        try:
+            self._release()
+        except OSError as e:
+            self._release_failed(now, e, "after the refusal")
+            return
+        self.mode = "bios"
+        self._status("BIOS (EC refused manual mode)")
+
+    def _lost_device(self):
+        if self.mode == "boost":
+            log("dell_smm device went away; the driver's unbind hook gave the fans back to the BIOS", 4)
+        self.mode, self.ready = "bios", False
+        self.policy.force_bios()
+
+    def _resumed(self, now, slept):
+        """After any sleep: forget the history and send the hand-back again."""
+        self.policy.force_bios()
+        self.policy.reset()
+        if not self.ready or not self.hw.present():
+            return                      # discovery sends the hand-back when the device is back
+        try:
+            self._release()
+        except OSError as e:
+            self._release_failed(now, e, f"after {slept:.0f} s asleep")
+            return
+        if self.mode == "boost":
+            log(f"resumed after {slept:.0f} s asleep; hand-back re-sent, BIOS has the fans")
+        self.mode = "bios"
+        self._status("BIOS")
+
+    def step(self):
+        now = self.clock()
+
+        j = self.jump()
+        if j - self.last_jump > 1.0:
+            self._resumed(now, j - self.last_jump)
+        self.last_jump = j
+
+        if not self.ready or not self.hw.present():
+            if self.ready:
+                self._lost_device()
+            if now < self.next_discover or now < self.refused_until:
+                return
+            self.next_discover = now + 5
+            try:
+                pair = self.hw.discover()
+            except NotReady as e:
+                if str(e) != self.waiting_reason:
+                    log(f"waiting: {e}")
+                    self._status(f"waiting: {e}")
+                    self.waiting_reason = str(e)
+                return
+            self.waiting_reason = None
+            self.ready = True
+            self.policy.force_bios()
+            try:
+                self._release()       # known starting point: BIOS in control
+            except OSError as e:
+                # Never take manual mode with this pair until the back-off ends.
+                self.refused_until = now + self.backoff
+                self.backoff = min(self.backoff * 2, self.c["REFUSAL_BACKOFF_MAX_S"])
+                self._release_failed(now, e, f"start-up (pair {pair} may be wrong)")
+                return
+            self.mode = "bios"
+            log(f"ready: pair {pair}, {self.hw.smm}, sensor {self.hw.pkg}")
+            self._status("BIOS")
+
+        temp = self.hw.read_pkg_c()     # OSError here is fatal: main() releases and exits 1
+        want = self.policy.update(now, temp)
+
+        if want == "boost" and self.mode == "bios":
+            if now < self.refused_until:
+                self.policy.force_bios()
+                return
+            try:
+                self.hw.take_control()
+            except OSError as e:
+                self._refused(now, f"manual mode ({e.strerror})")
+                return
+            self.mode, self.last_verify, self.strikes = "boost", now, 0
+            self.backoff = self.c["REFUSAL_BACKOFF_S"]
+            log(f"BOOST: fans to maximum ({self.policy.reason})")
+            self._status(f"BOOST since {time.strftime('%H:%M:%S')}")
+
+        elif want == "bios" and self.mode == "boost":
+            if now < self.release_retry_at:
+                return
+            try:
+                self._release()
+            except OSError as e:
+                self._release_failed(now, e, "BOOST -> BIOS")
+                return
+            self.mode = "bios"
+            log(f"BIOS: control handed back ({self.policy.reason or 'hand-back retried'})")
+            self._status("BIOS")
+
+        elif self.mode == "boost" and now - self.last_verify >= self.c["VERIFY_S"]:
+            self.last_verify = now
+            if self.hw.at_max():
+                self.strikes = 0
+            elif now < self.refused_until:
+                self._hold_quietly()
+            elif self.strikes == 0:
+                self.strikes = 1
+                log("EC left the maximum step on its own; asking again", 4)
+                try:
+                    self.hw.take_control()
+                except OSError as e:
+                    self._refused(now, f"manual mode ({e.strerror})")
+            else:
+                self._refused(now, "to hold the maximum step twice in a row")
+
+    def _hold_quietly(self):
+        try:
+            self.hw.hold_max()
+        except OSError:
+            pass
+
+    def shutdown(self):
+        if self.ready and self.mode == "boost":
+            try:
+                self._release()
+                log("stopping: control handed back to the BIOS")
+            except OSError as e:
+                try:
+                    self.hw.hold_max()
+                    held = "both fans set to 255"
+                except OSError as e2:
+                    held = f"setting 255 failed too ({e2.strerror})"
+                log(f"stopping: hand-back failed ({e.strerror}); {held}; ExecStopPost will retry", 3)
+        self.mode = "bios"
+
+
+def release_only(hw=None):
+    """ExecStopPost: hand the fans to the BIOS; on failure hold both at 255 and exit 1."""
+    hw = hw or Hw()
+    try:
+        hw.discover()
+    except NotReady:
+        return 0                        # stock or no driver: the BIOS already has the fans
+    try:
+        hw.release()
+    except OSError as e:
+        try:
+            hw.hold_max()
+            held = "both fans set to 255"
+        except OSError as e2:
+            held = f"setting 255 failed too ({e2.strerror})"
+        log(f"release: hand-back to the BIOS failed ({e.strerror}); {held}", 3)
+        return 1
+    return 0
+
+
+def main(argv):
+    if argv[1:] == ["--release"]:
+        return release_only()
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+
+    def on_term(signum, frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    gov = Governor(Hw(), CFG)
+    log("start: " + ", ".join(f"{k}={v:g}" for k, v in CFG.items()))
+    sd_notify("READY=1")
+    try:
+        while True:
+            gov.step()
+            sd_notify("WATCHDOG=1")
+            time.sleep(CFG["POLL_S"])
+    except SystemExit:
+        return 0
+    except Exception as e:  # noqa: BLE001 - any surprise: hand back, then let systemd restart us
+        log(f"fatal: {e!r}; handing control back to the BIOS", 3)
+        return 1
+    finally:
+        gov.shutdown()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

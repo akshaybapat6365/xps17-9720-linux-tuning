@@ -1,0 +1,151 @@
+--- a/drivers/hwmon/dell-smm-hwmon.c
++++ b/drivers/hwmon/dell-smm-hwmon.c
+@@ -146,6 +146,17 @@
+ module_param(fan_max, uint, 0);
+ MODULE_PARM_DESC(fan_max, "Maximum configurable fan speed (default: autodetect)");
+ 
++/*
++ * LOCAL PATCH (XPS 17 9720): no command pair for switching BIOS fan control
++ * is published for this model, so it is chosen at load time and defaults to
++ * none, which is exactly the upstream behaviour.
++ */
++static uint xps17_fan_ctrl;
++module_param(xps17_fan_ctrl, uint, 0444);
++MODULE_PARM_DESC(xps17_fan_ctrl, "XPS 17 9720 only: BIOS fan control command pair (0 = none, as upstream; 1 = 0x30a3/0x31a3; 2 = 0x34a3/0x35a3)");
++
++static bool xps17_fan_ctrl_active;
++
+ static bool disallow_fan_type_call, disallow_fan_support;
+ 
+ static unsigned int manual_fan, auto_fan;
+@@ -1658,6 +1669,75 @@
+ 	{ }
+ };
+ 
++/* LOCAL PATCH: the one model this build adds, gated by xps17_fan_ctrl. */
++static const struct dmi_system_id i8k_xps17_9720_dmi_table[] __initconst = {
++	{
++		.ident = "Dell XPS 17 9720",
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Dell Inc."),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "XPS 17 9720"),
++		},
++	},
++	{ }
++};
++
++/*
++ * LOCAL PATCH: give fan control back to the BIOS on unbind (rmmod), before
++ * every system sleep, again on every resume, and at power-off, so none of
++ * them can leave the fans in manual mode. Sending "BIOS on" while the BIOS
++ * already has the fans changes nothing, so every hook is safe to repeat.
++ * Active only when the XPS 17 9720 pair is. A failure is logged with the
++ * fixed text "could not return fan control", which the scripts search for.
++ */
++static void dell_smm_xps17_restore_auto(struct dell_smm_data *data, const char *when)
++{
++	int err;
++
++	mutex_lock(&data->i8k_mutex);
++	err = i8k_enable_fan_auto_mode(data, true);
++	mutex_unlock(&data->i8k_mutex);
++
++	if (err < 0)
++		pr_warn("XPS 17 9720: could not return fan control to the BIOS on %s (%d)\n",
++			when, err);
++}
++
++static void dell_smm_xps17_unbind(void *param)
++{
++	dell_smm_xps17_restore_auto(param, "unbind");
++}
++
++static int dell_smm_xps17_suspend(struct device *dev)
++{
++	struct dell_smm_data *data = dev_get_drvdata(dev);
++
++	if (xps17_fan_ctrl_active && data)
++		dell_smm_xps17_restore_auto(data, "suspend");
++
++	return 0;
++}
++
++static int dell_smm_xps17_resume(struct device *dev)
++{
++	struct dell_smm_data *data = dev_get_drvdata(dev);
++
++	if (xps17_fan_ctrl_active && data)
++		dell_smm_xps17_restore_auto(data, "resume");
++
++	return 0;	/* never fail a resume over the fans */
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(dell_smm_xps17_pm_ops, dell_smm_xps17_suspend,
++				dell_smm_xps17_resume);
++
++static void dell_smm_wmi_shutdown(struct wmi_device *wdev)
++{
++	struct dell_smm_data *data = dev_get_drvdata(&wdev->dev);
++
++	if (xps17_fan_ctrl_active && data)
++		dell_smm_xps17_restore_auto(data, "shutdown");
++}
++
+ /*
+  * Legacy SMM backend driver.
+  */
+@@ -1709,6 +1789,18 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/*
++	 * LOCAL PATCH: devm actions run in reverse order on unbind. Registered
++	 * here, after the data it uses and before the hwmon and cooling devices,
++	 * the hand-back runs once nothing can write pwm1_enable any more.
++	 */
++	if (xps17_fan_ctrl_active) {
++		ret = devm_add_action_or_reset(&wdev->dev, dell_smm_xps17_unbind,
++					       dev_get_drvdata(&wdev->dev));
++		if (ret)
++			return ret;
++	}
++
+ 	return dell_smm_init_hwmon(&wdev->dev);
+ }
+ 
+@@ -1722,9 +1814,11 @@
+ 	.driver = {
+ 		.name = KBUILD_MODNAME,
+ 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
++		.pm = pm_sleep_ptr(&dell_smm_xps17_pm_ops),	/* LOCAL PATCH */
+ 	},
+ 	.id_table = dell_smm_wmi_id_table,
+ 	.probe = dell_smm_wmi_probe,
++	.shutdown = dell_smm_wmi_shutdown,	/* LOCAL PATCH */
+ 	.no_singleton = true,
+ };
+ 
+@@ -1777,6 +1871,23 @@
+ 
+ 		pr_info("Enabling support for setting automatic/manual fan control\n");
+ 	}
++
++	/* LOCAL PATCH: XPS 17 9720, pair chosen by xps17_fan_ctrl (0 = none) */
++	if (!auto_fan && xps17_fan_ctrl && dmi_check_system(i8k_xps17_9720_dmi_table)) {
++		if (xps17_fan_ctrl > ARRAY_SIZE(i8k_fan_control_data)) {
++			pr_warn("XPS 17 9720: xps17_fan_ctrl=%u is not a known pair, ignored\n",
++				xps17_fan_ctrl);
++		} else {
++			const struct i8k_fan_control_data *pair =
++				&i8k_fan_control_data[xps17_fan_ctrl - 1];
++
++			manual_fan = pair->manual_fan;
++			auto_fan = pair->auto_fan;
++			xps17_fan_ctrl_active = true;
++			pr_info("XPS 17 9720: trying fan control pair 0x%04x/0x%04x\n",
++				manual_fan, auto_fan);
++		}
++	}
+ }
+ 
+ static int __init dell_smm_legacy_check(void)

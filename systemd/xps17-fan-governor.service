@@ -1,0 +1,53 @@
+[Unit]
+Description=XPS 17 9720 fan governor (more fan than the BIOS, never less)
+Documentation=https://github.com/akshaybapat6365/xps17-9720-linux-tuning#readme
+After=systemd-modules-load.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/lib/xps17-fan-control/xps17-fan-governor
+# Runs after every stop: clean, crash, watchdog kill, or start-limit failure.
+ExecStopPost=/usr/local/lib/xps17-fan-control/xps17-fan-governor --release
+WatchdogSec=10s
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+Nice=-5
+# Background work stays off the fast cores (measured 2026-11-19: short jobs on a fast core are what
+# spike the chip to 100 C). The efficiency cores of this model are CPUs 12-19.
+CPUAffinity=12-19
+
+# Thresholds (README "Thresholds"); change with a drop-in, not here.
+#Environment=HOT_C=88 RISE_C=10 RISE_WINDOW_S=2 RISE_FLOOR_C=80
+#Environment=COOL_C=75 COOL_HOLD_S=60 MIN_BOOST_S=60 POLL_S=0.5 VERIFY_S=15
+#Environment=AVG_WINDOW_S=60 AVG_ON_C=68 AVG_OFF_C=62 MIN_BIOS_S=60 RELEASE_RETRY_S=30
+
+# Needs only: read coretemp, read/write dell_smm hwmon files under /sys.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+MemoryMax=64M
+TasksMax=4
+
+[Install]
+WantedBy=multi-user.target

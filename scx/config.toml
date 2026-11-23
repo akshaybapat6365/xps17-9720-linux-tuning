@@ -1,0 +1,5 @@
+# Dell XPS 17 9720 (i9-12900HK hybrid P+E cores):
+# scx_lavd (Latency-criticality Aware Virtual Deadline) keeps interactive
+# foreground tasks snappy across P-cores while handling background load cleanly.
+default_sched = "scx_lavd"
+default_mode = "Auto"

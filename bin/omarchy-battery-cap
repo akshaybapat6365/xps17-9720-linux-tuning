@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Dell XPS 17 9720 battery charge threshold manager (BAT0).
+# Usage:
+#   omarchy-battery-cap status   Show battery health, level, voltage, and thresholds
+#   omarchy-battery-cap desk     Preserve battery longevity (Custom 55-80% cap)
+#   omarchy-battery-cap travel   Allow full 100% charge for travel (Standard mode)
+set -euo pipefail
+
+BAT_DIR="/sys/class/power_supply/BAT0"
+TRAVEL_FLAG="/run/omarchy-battery-cap.travel"
+DESK_START=55
+DESK_END=80
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-battery-cap <status|desk|travel>
+
+  status   Print BAT0 health %, charge level, voltage, charge type, and thresholds
+  desk     Set Custom 55-80% charge cap (persists across reboots via udev)
+  travel   Set Standard mode (charges to 100% for travel; pauses udev cap until reboot or 'desk')
+EOF
+}
+
+require_bat() {
+  if [[ ! -d "$BAT_DIR" ]]; then
+    echo "Error: $BAT_DIR not found." >&2
+    exit 1
+  fi
+}
+
+write_sysfs() {
+  local path="$1"
+  local value="$2"
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    printf '%s\n' "$value" > "$path"
+  else
+    printf '%s\n' "$value" | sudo tee "$path" >/dev/null
+  fi
+}
+
+active_charge_type() {
+  local raw
+  raw="$(<"$BAT_DIR/charge_types")"
+  if [[ "$raw" =~ \[([^]]+)\] ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+  else
+    printf '%s\n' "$raw"
+  fi
+}
+
+cmd_status() {
+  require_bat
+  local status cap volt_uv volt_v full design unit health_pct ctype start end travel_state
+
+  status="$(<"$BAT_DIR/status")"
+  cap="$(<"$BAT_DIR/capacity")"
+  volt_uv="$(<"$BAT_DIR/voltage_now")"
+  volt_v="$(awk -v u="$volt_uv" 'BEGIN { printf "%.3f", u / 1000000 }')"
+
+  if [[ -r "$BAT_DIR/charge_full" && -r "$BAT_DIR/charge_full_design" ]]; then
+    full="$(<"$BAT_DIR/charge_full")"
+    design="$(<"$BAT_DIR/charge_full_design")"
+    unit="mAh"
+  elif [[ -r "$BAT_DIR/energy_full" && -r "$BAT_DIR/energy_full_design" ]]; then
+    full="$(<"$BAT_DIR/energy_full")"
+    design="$(<"$BAT_DIR/energy_full_design")"
+    unit="mWh"
+  else
+    full=0
+    design=0
+    unit=""
+  fi
+
+  if [[ "$design" -gt 0 ]]; then
+    health_pct="$(awk -v f="$full" -v d="$design" 'BEGIN { printf "%.1f%% (%d / %d %s)", (f * 100.0) / d, f / 1000, d / 1000, "'"$unit"'" }')"
+  else
+    health_pct="unknown"
+  fi
+
+  ctype="$(active_charge_type)"
+  start="$(<"$BAT_DIR/charge_control_start_threshold")"
+  end="$(<"$BAT_DIR/charge_control_end_threshold")"
+  if [[ -e "$TRAVEL_FLAG" ]]; then
+    travel_state="active (udev desk cap paused)"
+  else
+    travel_state="inactive (udev desk cap active)"
+  fi
+
+  printf 'Battery:        BAT0\n'
+  printf 'Health:         %s\n' "$health_pct"
+  printf 'Level:          %s%% (%s, %s V)\n' "$cap" "$status" "$volt_v"
+  printf 'Charge type:    %s\n' "$ctype"
+  printf 'Thresholds:     start=%s%%, end=%s%%\n' "$start" "$end"
+  printf 'Travel flag:    %s\n' "$travel_state"
+}
+
+cmd_desk() {
+  require_bat
+  local cur_end
+  if [[ -e "$TRAVEL_FLAG" ]]; then
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+      rm -f -- "$TRAVEL_FLAG"
+    else
+      sudo rm -f -- "$TRAVEL_FLAG"
+    fi
+  fi
+
+  write_sysfs "$BAT_DIR/charge_types" "Custom"
+  cur_end="$(<"$BAT_DIR/charge_control_end_threshold")"
+  if (( cur_end <= DESK_START )); then
+    write_sysfs "$BAT_DIR/charge_control_end_threshold" "$DESK_END"
+    write_sysfs "$BAT_DIR/charge_control_start_threshold" "$DESK_START"
+  else
+    write_sysfs "$BAT_DIR/charge_control_start_threshold" "$DESK_START"
+    write_sysfs "$BAT_DIR/charge_control_end_threshold" "$DESK_END"
+  fi
+  cmd_status
+}
+
+cmd_travel() {
+  require_bat
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    : > "$TRAVEL_FLAG"
+  else
+    sudo touch "$TRAVEL_FLAG"
+  fi
+  write_sysfs "$BAT_DIR/charge_types" "Standard"
+  cmd_status
+}
+
+case "${1:-status}" in
+  status)
+    cmd_status
+    ;;
+  desk)
+    cmd_desk
+    ;;
+  travel)
+    cmd_travel
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,9 @@
+# Keep the Intel LPSS I2C controller that carries the ELAN 04F3:311C touchpad
+# (PCI 0000:00:15.1, bus i2c-6, nothing else on it) out of runtime suspend.
+#
+# 2026-09-06: the touchpad went silent mid-session — its interrupt line never
+# fired — with every software layer healthy, and the controller sitting in
+# runtime suspend. It came back after driver/controller resets with this set.
+# Random I2C touchpad drop-outs on Intel laptops are the textbook symptom of the
+# controller failing to leave suspend; keeping it awake costs negligible power.
+ACTION=="add", SUBSYSTEM=="pci", KERNEL=="0000:00:15.1", DRIVER=="intel-lpss", ATTR{power/control}="on"

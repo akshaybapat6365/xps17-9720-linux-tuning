@@ -1,0 +1,3 @@
+# Keep the Intel LPSS I2C controller carrying the ELAN2097:00 touchscreen
+# (PCI 0000:00:15.0, i2c-5) out of runtime suspend so touch wake never drops out.
+ACTION=="add", SUBSYSTEM=="pci", KERNEL=="0000:00:15.0", DRIVER=="intel-lpss", ATTR{power/control}="on"
