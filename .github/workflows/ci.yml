@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell & Python checks
+        run: |
+          bash -n install.sh uninstall.sh PKGBUILD bin/omarchy-battery-cap
+          python3 -m py_compile governor/xps17-fan-governor
+      - name: Verify mandatory DMI guard & sandboxed --force install
+        run: |
+          if ./install.sh --all --dry-run 2>/dev/null; then
+            echo "DMI guard should refuse non-XPS17 CI runner!" >&2
+            exit 1
+          fi
+          TEST_ROOT="$(mktemp -d)"
+          ./install.sh --all --force --root "$TEST_ROOT"
+          test -f "$TEST_ROOT/etc/systemd/system/xps17-fan-governor.service"
+          ./uninstall.sh --all --root "$TEST_ROOT"
