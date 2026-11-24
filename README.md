@@ -60,6 +60,10 @@ omarchy-battery-cap desk      # Enforce Custom 55-80% charge cap (persists acros
 omarchy-battery-cap travel    # Allow 100% Standard charge until reboot or 'desk'
 ```
 
+## Companion Studio Audio Stack (`xps17-studio-audio`)
+
+For the quad-speaker subsystem (`2×2W` woofers + `2×2W` tweeters on dual SoundWire `ALC1316` smart amplifiers, `DMI product_sku = 0AFF`), install the companion **[`xps17-studio-audio`](https://github.com/akshaybapat6365/xps17-studio-audio)** engineering stack (custom `snd-soc-rt1316-sdw` v7.2.15.2 DKMS hardware crossover `0xC202=0xC0`, SOF IPC4 DRC fence, 4096-tap minimum-phase FIR kernels, and 7-stage AVX2/FMA + Rust LADSPA DSP engine).
+
 ## Hyprland Display Setup (`SHP1517-d65.icc`)
 
 See [`hypr/monitors.xps17.lua.example`](hypr/monitors.xps17.lua.example) for wiring `SHP1517-d65.icc` at `3840x2400@59.994` with `scale = 1.6` and `cm = "auto"`.
