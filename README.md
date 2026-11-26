@@ -6,7 +6,7 @@ Measured, failsafe **thermal, acoustic, battery, GPU, scheduler, Wi-Fi, I2C inpu
 > **Hardware-Specific Configuration.** These udev rules, PCI addresses (`0000:00:15.0`/`0000:00:15.1`), Dell SMM opcodes (`0x30a3`/`0x31a3`), and the `SHP1517` D65 ICC profile are engineered specifically for the **Dell XPS 17 9720**. `install.sh` enforces a **mandatory DMI guard** checking `/sys/class/dmi/id/product_name` and refuses to write configs on other hardware unless `--force` is explicitly passed.
 
 <p align="center">
-  <img src="assets/thermal-fan-profile.png" alt="Dell XPS 17 9720 Sustained-Heat Fan Governor Profile and Hardware Tuning Architecture" width="100%">
+  <a href="assets/thermal-fan-profile.png"><img src="assets/thermal-fan-profile.png" alt="Dell XPS 17 9720 Sustained-Heat Fan Governor Profile and Hardware Tuning Architecture (4K)" width="100%"></a>
 </p>
 
 ## Modules Included
